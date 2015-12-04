@@ -1,0 +1,148 @@
+#!/bin/bash
+
+set -e
+
+grn='\e[0;32m'
+red='\e[0;31m'
+nrm='\e[0m'
+
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    echo "fuji is a very simple usb drive mounter."
+    echo
+    echo "USAGE"
+    echo " - plug in a single usb drive that contains a single partition"
+    echo " - run 'fuji' to mount the drive; run 'fuji' again to unmount"
+    echo
+    echo "NOTES"
+    echo " - the drive will be mounted to /mnt/fuji"
+    echo " - the drive is chowned (and thus writable) to the user"
+    echo " - luks encryption is taken care of automatically"
+    echo
+    echo "fuji is thus intended for a simple use case:"
+    echo " - the user only needs to mount one usb drive at a time"
+    echo " - the user only needs one partition on a drive"
+    echo
+    echo "fuji can also 'wipe' a usb drive to a blank, single-partition state:"
+    echo " - 'fuji --blank' makes a blank ext4 (standard linux) drive"
+    echo " - 'fuji --winblank' makes a blank ntfs (windows compatible) drive"
+    echo " - 'fuji --cryptblank' makes an encrypted blank ext4 drive"
+    exit 0
+fi
+
+if [[ $# -eq 1 && "$1" != "--blank" && "$1" != "--winblank" \
+    && "$1" != "--cryptblank" ]]; then
+    echo "invalid argument; see 'fuji --help'"
+    exit 1
+fi
+
+if [ $# -gt 1 ]; then
+    echo -e "error: too many arguments; see 'fuji --help'"
+    exit 1
+fi
+
+if [[ -d /mnt/fuji && ! -z "$(ls -A /mnt/fuji)" ]]; then
+    if echo $PWD | grep ^/mnt/fuji > /dev/null; then
+        echo "exit mount directory before unmounting device"
+        exit 1
+    else
+        sudo umount /mnt/fuji
+        echo "usb drive unmounted"
+        if lsblk | grep fujicrypt > /dev/null; then
+            sudo cryptsetup luksClose fujicrypt
+            echo "encrypted partition closed"
+        fi
+        exit 0
+    fi
+fi
+
+echo "checking whether one (and only one) usb drive is present..."
+
+if ! ls /dev/disk/by-id/usb* > /dev/null 2>&1; then
+    echo -e $red"check failed: no usb drive detected"$nrm
+    exit 1
+fi
+
+if [ $(ls /dev/disk/by-id/usb* | sed 's#.*/##' | sed 's/-part[0-9]*//' | \
+    sort -u | uniq -u | wc -l) -gt 1 ]; then
+    echo -e $red"check failed: multiple usb drives detected"$nrm
+    exit 1
+fi
+
+echo -e $grn"check succeeded"$nrm
+
+driv_id=$(ls /dev/disk/by-id/usb* | grep -v part[0-9]*$)
+driv_dir=$(readlink $driv_id | sed 's#.*/##' | sed 's#^#/dev/#')
+
+if [ $# -eq 1 ]; then
+    if [[ "$1" != "--blank" && "$1" != "--winblank" && \
+        "$1" != "--cryptblank" ]]; then
+        echo "invalid argument; see 'fuji --help'"
+        exit 1
+    else
+        read -r -n 1 -p "device $driv_dir will be wiped; continue? [y/N] "
+        if [[ $REPLY =~ ^[Yy]$ ]]
+        then
+            echo
+            echo "clearing partition data..."
+            sudo sgdisk -o $driv_dir
+            echo "creating one partition that spans the entire drive..."
+            sudo sgdisk -n 1:0:0 $driv_dir
+            if [ "$1" = "--blank" ]; then
+                echo "formatting partition to ext4..."
+                sudo mkfs.ext4 $driv_dir\1
+            elif [ "$1" = "--winblank" ]; then
+                echo "formatting partition to ntfs..."
+                sudo mkfs.ntfs -f $driv_dir\1
+            else
+                echo "encrypting partition..."
+                sudo cryptsetup -c aes-xts-plain64 -s 512 -h sha512 -i 5000\
+                    --use-random luksFormat $driv_dir\1
+                echo "opening encrypted partition..."
+                sudo cryptsetup luksOpen $driv_dir\1 cryptblank
+                echo "formatting partition to ext4..."
+                sudo mkfs.ext4 /dev/mapper/cryptblank
+                echo "closing encrypted partition..."
+                sudo cryptsetup luksClose cryptblank
+            fi
+            echo "usb wipe complete"
+            exit 0
+        else
+            echo
+            echo "usb wipe cancelled"
+            exit 1
+        fi
+    fi
+fi
+
+echo "checking whether usb drive contains one (and only one) partition..."
+
+if ! ls /dev/disk/by-id/usb* | grep part[0-9]*$ > /dev/null; then
+    echo -e $red"check failed: no partition detected"$nrm
+    exit 1
+fi
+
+if [ $(ls /dev/disk/by-id/usb* | grep part[0-9]*$ | wc -l) -eq 1 ]; then
+    echo -e $grn"check succeeded"$nrm
+else
+    echo -e $red"check failed: multiple partitions detected"$nrm
+    exit 1
+fi
+
+part_id=$(ls /dev/disk/by-id/usb* | grep part1$)
+part_dir=$(readlink $part_id | sed 's#.*/##' | sed 's#^#/dev/#')
+
+if [ ! -d /mnt/fuji ]; then
+    sudo mkdir /mnt/fuji
+fi
+
+if sudo blkid | grep $part_dir | grep TYPE=\"crypto_LUKS\" > /dev/null; then
+    sudo cryptsetup luksOpen $part_dir fujicrypt
+    echo "encrypted partition opened"
+    sudo mount /dev/mapper/fujicrypt /mnt/fuji
+    echo "usb drive mounted to /mnt/fuji"
+else
+    sudo mount $part_dir /mnt/fuji
+    echo "usb drive mounted to /mnt/fuji"
+fi
+
+sudo chown -R $USER:$USER /mnt/fuji
